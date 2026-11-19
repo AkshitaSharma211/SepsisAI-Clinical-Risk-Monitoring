@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 
 const API_BASE_URL = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/$/, "");
@@ -6,7 +6,7 @@ const API_BASE_URL = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").r
 function normalizePatient(p) {
   const risk = Number(p.risk ?? p.risk_value ?? 0);
   const level = String(p.risk_level || (risk >= 70 ? "HIGH" : risk >= 40 ? "MEDIUM" : "LOW")).toUpperCase();
-  return { ...p, id: p.id || p.patient_id, hr: Number(p.hr ?? p.heart_rate ?? 0), bp: p.bp || `${p.systolic_bp ?? 0}/${p.diastolic_bp ?? 0}`, spo2: Number(p.spo2 ?? 0), rr: Number(p.rr ?? p.respiratory_rate ?? 0), temp: String(p.temp ?? `${p.temperature ?? 0}°`), lactate: String(p.lactate ?? ""), risk, risk_level: level, status: p.status || (level === "HIGH" ? "Critical" : level === "MEDIUM" ? "Watch" : "Stable") };
+  return { ...p, id: p.id || p.patient_id, hr: Number(p.hr ?? p.heart_rate ?? 0), bp: p.bp || `${p.systolic_bp ?? 0}/${p.diastolic_bp ?? 0}`, spo2: Number(p.spo2 ?? 0), rr: Number(p.rr ?? p.respiratory_rate ?? 0), temp: String(p.temp ?? `${p.temperature ?? 0}°`), lactate: String(p.lactate ?? ""), risk, risk_level: level, status: p.status || (level === "HIGH" ? "Critical" : level === "MEDIUM" ? "Watch" : "Stable"), isApiPatient: true };
 }
 
 async function fetchJson(path, options = {}) {
@@ -16,10 +16,23 @@ async function fetchJson(path, options = {}) {
   });
   if (!response.ok) {
     let detail = `Request failed (${response.status})`;
-    try { const body = await response.json(); detail = body.detail || detail; } catch { /* keep default */ }
-    throw new Error(detail);
+    try {
+      const body = await response.json();
+      if (typeof body.detail === "string") detail = body.detail;
+      else if (Array.isArray(body.detail)) {
+        detail = body.detail.map((item) => `${item.loc?.at(-1) || "Input"}: ${item.msg || "Invalid value"}`).join("; ");
+      }
+    } catch { /* keep the status-based message */ }
+    const error = new Error(detail);
+    error.httpStatus = response.status;
+    throw error;
   }
-  return response.json();
+  try {
+    return await response.json();
+  } catch (error) {
+    error.httpStatus = response.status;
+    throw error;
+  }
 }
 
 /* =====================================================
@@ -297,6 +310,38 @@ function App() {
       console.error("Could not create patient:", error);
       alert("Unable to save this patient. Check that the SepsisAI API is running and review the error in the browser console.\n\n" + error.message);
     }
+  };
+
+  const saveObservation = async (patientId, payload) => {
+    const apiPatient = patients.find((patient) => patient.id === patientId && patient.isApiPatient);
+    if (!apiConnected || !apiPatient) {
+      const error = new Error("A backend-loaded patient and an active API connection are required to save an observation.");
+      error.requestNotSent = true;
+      throw error;
+    }
+
+    const response = await fetchJson(`/patients/${encodeURIComponent(patientId)}/observations`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const updatedPatient = normalizePatient(response);
+    if (updatedPatient.id !== patientId) {
+      const error = new Error("The server response did not match the selected patient.");
+      error.outcomeUncertain = true;
+      throw error;
+    }
+
+    setPatients((current) => current.map((patient) => patient.id === patientId && patient.isApiPatient ? updatedPatient : patient));
+    setSelectedPatient((current) => current?.id === patientId && current.isApiPatient ? updatedPatient : current);
+
+    let alertRefreshError = "";
+    try {
+      setAlerts(await fetchJson("/alerts"));
+    } catch (error) {
+      alertRefreshError = error.message || "The active alerts could not be refreshed.";
+    }
+
+    return { patient: updatedPatient, alertRefreshError };
   };
 
   /* =====================================================
@@ -589,7 +634,10 @@ function App() {
 
       {selectedPatient && (
         <PatientDetails
+          key={selectedPatient.id}
           patient={selectedPatient}
+          apiConnected={apiConnected}
+          onSaveObservation={saveObservation}
           onClose={() =>
             setSelectedPatient(null)
           }
@@ -1979,16 +2027,41 @@ function AddPatientModal({
 
 function PatientDetails({
   patient,
+  apiConnected,
+  onSaveObservation,
   onClose,
 }) {
   const [history, setHistory] = useState([]);
+  const [historyError, setHistoryError] = useState(patient.isApiPatient ? "" : "Assessment history is available only for a patient loaded from the backend.");
+  const [showVitalsForm, setShowVitalsForm] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   useEffect(() => {
     let cancelled = false;
+    if (!patient.isApiPatient) return () => { cancelled = true; };
     fetchJson(`/patients/${encodeURIComponent(patient.id)}/history`)
       .then((rows) => { if (!cancelled) setHistory(rows); })
-      .catch((error) => console.warn("History unavailable:", error.message));
+      .catch((error) => { if (!cancelled) setHistoryError(error.message || "History could not be loaded."); });
     return () => { cancelled = true; };
-  }, [patient.id]);
+  }, [patient.id, patient.isApiPatient]);
+
+  const saveAndRefresh = async (patientId, payload) => {
+    const result = await onSaveObservation(patientId, payload);
+    const refreshErrors = [];
+    if (result.alertRefreshError) refreshErrors.push({ view: "active alerts", error: result.alertRefreshError });
+    try {
+      const rows = await fetchJson(`/patients/${encodeURIComponent(patientId)}/history`);
+      if (patient.id === patientId) {
+        setHistory(rows);
+        setHistoryError("");
+      }
+    } catch (error) {
+      const message = error.message || "The assessment history could not be refreshed.";
+      if (patient.id === patientId) setHistoryError(message);
+      refreshErrors.push({ view: "assessment history", error: message });
+    }
+    return { ...result, refreshErrors };
+  };
+
   return (
     <div className="modal-overlay">
 
@@ -2015,6 +2088,8 @@ function PatientDetails({
           <button
             className="modal-close"
             onClick={onClose}
+            disabled={isSaving}
+            aria-label="Close patient details"
           >
             ×
           </button>
@@ -2083,7 +2158,7 @@ function PatientDetails({
 
         <div className="review-section">
           <h4>Recent assessment history</h4>
-          {history.length === 0 ? <p>No saved assessment history yet.</p> : (
+          {!patient.isApiPatient ? <p role="status">Assessment history is available only for a patient loaded from the backend.</p> : historyError ? <p role="status">{historyError}</p> : history.length === 0 ? <p>No saved assessment history yet.</p> : (
             <div className="history-list">
               {history.slice(0, 5).map((item) => (
                 <div className="history-row" key={item.id || item.created_at}>
@@ -2095,11 +2170,33 @@ function PatientDetails({
           )}
         </div>
 
+        <div className="update-vitals-section">
+          {!showVitalsForm ? (
+            <button
+              className="outline-button"
+              type="button"
+              onClick={() => setShowVitalsForm(true)}
+            >
+              Update vitals
+            </button>
+          ) : (
+            <UpdateVitalsForm
+              patient={patient}
+              canSave={Boolean(patient.isApiPatient && apiConnected)}
+              isSaving={isSaving}
+              onSavingChange={setIsSaving}
+              onSave={saveAndRefresh}
+              onCancel={() => setShowVitalsForm(false)}
+            />
+          )}
+        </div>
+
         <div className="modal-actions">
 
           <button
             className="outline-button"
             onClick={onClose}
+            disabled={isSaving}
           >
             Close
           </button>
@@ -2109,6 +2206,234 @@ function PatientDetails({
       </div>
 
     </div>
+  );
+}
+
+const VITAL_FIELDS = [
+  { key: "heart_rate", label: "Heart rate", unit: "bpm", min: 0, max: 300, minExclusive: true },
+  { key: "spo2", label: "SpO₂", unit: "%", min: 0, max: 100 },
+  { key: "respiratory_rate", label: "Respiratory rate", unit: "breaths/min", min: 0, max: 100, minExclusive: true },
+  { key: "temperature", label: "Temperature", unit: "°C", min: 25, max: 45 },
+  { key: "lactate", label: "Lactate", unit: "mmol/L", min: 0, max: 50 },
+  { key: "wbc", label: "WBC count", unit: "×10⁹/L", min: 0, max: 500, optional: true },
+  { key: "platelets", label: "Platelets", unit: "×10⁹/L", min: 0, max: 3000, optional: true },
+  { key: "creatinine", label: "Creatinine", unit: "mg/dL", min: 0, max: 100, optional: true },
+  { key: "bilirubin", label: "Bilirubin", unit: "mg/dL", min: 0, max: 100, optional: true },
+  { key: "hemoglobin", label: "Hemoglobin", unit: "g/dL", min: 0, max: 40, optional: true },
+];
+
+function patientValue(patient, keys) {
+  for (const key of keys) {
+    const value = patient[key];
+    if (value !== undefined && value !== null && value !== "") return String(value).replace(/°\s*C?$/, "");
+  }
+  return "";
+}
+
+function initialVitalsForm(patient) {
+  let systolic = patientValue(patient, ["systolic_bp"]);
+  let diastolic = patientValue(patient, ["diastolic_bp"]);
+  if (!systolic || !diastolic) {
+    const match = String(patient.bp || "").match(/^\s*([^/]+)\s*\/\s*([^/]+)\s*$/);
+    if (match) {
+      systolic ||= match[1].trim();
+      diastolic ||= match[2].trim();
+    }
+  }
+  return {
+    heart_rate: patientValue(patient, ["hr", "heart_rate"]),
+    blood_pressure: systolic && diastolic ? `${systolic}/${diastolic}` : "",
+    spo2: patientValue(patient, ["spo2"]),
+    respiratory_rate: patientValue(patient, ["rr", "respiratory_rate"]),
+    temperature: patientValue(patient, ["temperature", "temp"]),
+    lactate: patientValue(patient, ["lactate"]),
+    wbc: patientValue(patient, ["wbc"]),
+    platelets: patientValue(patient, ["platelets"]),
+    creatinine: patientValue(patient, ["creatinine"]),
+    bilirubin: patientValue(patient, ["bilirubin"]),
+    hemoglobin: patientValue(patient, ["hemoglobin"]),
+  };
+}
+
+function rangeError(value, field) {
+  if (!Number.isFinite(value)) return "Enter a finite number.";
+  if ((field.minExclusive ? value <= field.min : value < field.min) || value > field.max) {
+    const left = field.minExclusive ? "greater than" : "at least";
+    return `Enter a value ${left} ${field.min} and no more than ${field.max} ${field.unit}.`;
+  }
+  return "";
+}
+
+function validateVitalsForm(form) {
+  const nextErrors = {};
+  const bloodPressure = form.blood_pressure.match(/^\s*(\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)\s*$/);
+  if (!form.blood_pressure.trim()) {
+    nextErrors.blood_pressure = "Enter systolic and diastolic pressure.";
+  } else if (!bloodPressure) {
+    nextErrors.blood_pressure = "Enter blood pressure as systolic/diastolic, for example 110/70.";
+  } else {
+    const [systolic, diastolic] = bloodPressure.slice(1).map(Number);
+    const systolicError = rangeError(systolic, { min: 0, max: 350, minExclusive: true, unit: "mmHg" });
+    const diastolicError = rangeError(diastolic, { min: 0, max: 250, minExclusive: true, unit: "mmHg" });
+    if (systolicError || diastolicError) {
+      nextErrors.blood_pressure = [
+        systolicError && `Systolic pressure: ${systolicError}`,
+        diastolicError && `Diastolic pressure: ${diastolicError}`,
+      ].filter(Boolean).join(" ");
+    }
+  }
+
+  for (const field of VITAL_FIELDS) {
+    const rawValue = form[field.key].trim();
+    if (field.optional && !rawValue) continue;
+    if (!rawValue) {
+      nextErrors[field.key] = "This field is required.";
+      continue;
+    }
+    const error = rangeError(Number(rawValue), field);
+    if (error) nextErrors[field.key] = error;
+  }
+  return nextErrors;
+}
+
+function observationPayload(form) {
+  const [systolic, diastolic] = form.blood_pressure.split("/").map((value) => Number(value.trim()));
+  const payload = {
+    heart_rate: Number(form.heart_rate),
+    systolic_bp: systolic,
+    diastolic_bp: diastolic,
+    spo2: Number(form.spo2),
+    respiratory_rate: Number(form.respiratory_rate),
+    temperature: Number(form.temperature),
+    lactate: Number(form.lactate),
+  };
+  for (const field of VITAL_FIELDS.filter((item) => item.optional)) {
+    const value = form[field.key].trim();
+    if (value) payload[field.key] = Number(value);
+  }
+  return payload;
+}
+
+function UpdateVitalsForm({ patient, canSave, isSaving, onSavingChange, onSave, onCancel }) {
+  const [form, setForm] = useState(() => initialVitalsForm(patient));
+  const [errors, setErrors] = useState({});
+  const [feedback, setFeedback] = useState(null);
+  const submittingRef = useRef(false);
+  const activePatientIdRef = useRef(patient.id);
+
+  useEffect(() => {
+    activePatientIdRef.current = patient.id;
+    return () => { activePatientIdRef.current = null; };
+  }, [patient.id]);
+
+  const update = (field, value) => {
+    setForm((current) => ({ ...current, [field]: value }));
+    setErrors((current) => ({ ...current, [field]: undefined }));
+    setFeedback(null);
+  };
+
+  const saveObservation = async (event) => {
+    event.preventDefault();
+    if (submittingRef.current) return;
+    const nextErrors = validateVitalsForm(form);
+    setErrors(nextErrors);
+    if (Object.keys(nextErrors).length) {
+      setFeedback(null);
+      return;
+    }
+    if (!canSave) {
+      setFeedback({
+        type: "error",
+        message: "Saving requires an active backend connection and a patient loaded from that backend. Sample patients cannot be saved.",
+      });
+      return;
+    }
+
+    const submittedPatientId = patient.id;
+    submittingRef.current = true;
+    onSavingChange(true);
+    setFeedback({ type: "saving", message: "Saving observation…" });
+    try {
+      const result = await onSave(submittedPatientId, observationPayload(form));
+      if (activePatientIdRef.current !== submittedPatientId) return;
+      const refreshDetails = result.refreshErrors.map((item) => `${item.view}: ${item.error}`).join(" ");
+      const savedMessage = refreshDetails
+        ? `Observation saved, but ${result.refreshErrors.map((item) => item.view).join(" and ")} could not be refreshed. ${refreshDetails}`
+        : "Observation saved.";
+      setFeedback({
+        type: refreshDetails ? "refresh-warning" : "success",
+        message: savedMessage,
+        assessmentWarning: result.patient.prediction_warning || "This research prototype is not clinically validated and is not for medical decisions.",
+      });
+    } catch (error) {
+      if (activePatientIdRef.current !== submittedPatientId) return;
+      if (error.requestNotSent) {
+        setFeedback({ type: "error", message: error.message });
+      } else if (error.outcomeUncertain || !error.httpStatus || error.httpStatus >= 500 || (error.httpStatus >= 200 && error.httpStatus < 300)) {
+        setFeedback({
+          type: "uncertain",
+          message: "We couldn't confirm whether this observation was saved. Check this patient's assessment history before retrying. " + (error.message || "The connection was interrupted."),
+        });
+      } else {
+        setFeedback({ type: "error", message: `Save rejected: ${error.message}. Your entries are still here.` });
+      }
+    } finally {
+      submittingRef.current = false;
+      if (activePatientIdRef.current === submittedPatientId) onSavingChange(false);
+    }
+  };
+
+  return (
+    <section className="update-vitals-form" aria-labelledby="update-vitals-title">
+      <h4 id="update-vitals-title">Update vitals</h4>
+      <p className="update-vitals-note">
+        An empty optional lab retains its stored value. The assessment is an experimental research output, not a clinical decision.
+      </p>
+      {!patient.isApiPatient && <p className="update-vitals-notice" role="status">This is a built-in sample patient. To save an observation, select a patient loaded from the backend.</p>}
+      {patient.isApiPatient && !canSave && <p className="update-vitals-notice" role="status">The API is disconnected. Reconnect and select a patient loaded from the backend before saving.</p>}
+      <form onSubmit={saveObservation} noValidate>
+        <div className="update-vitals-grid">
+          <label className="update-vitals-field">
+            Blood pressure <span>(mmHg)</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={form.blood_pressure}
+              onChange={(event) => update("blood_pressure", event.target.value)}
+              disabled={isSaving}
+              aria-invalid={Boolean(errors.blood_pressure)}
+              aria-describedby={errors.blood_pressure ? "error-blood_pressure" : undefined}
+            />
+            {errors.blood_pressure && <small className="update-vitals-error" id="error-blood_pressure">{errors.blood_pressure}</small>}
+          </label>
+          {VITAL_FIELDS.map((field) => (
+            <label className="update-vitals-field" key={field.key}>
+              {field.label} {field.optional && <span>(optional)</span>} <span>({field.unit})</span>
+              <input
+                type="text"
+                inputMode="decimal"
+                value={form[field.key]}
+                onChange={(event) => update(field.key, event.target.value)}
+                disabled={isSaving}
+                aria-invalid={Boolean(errors[field.key])}
+                aria-describedby={errors[field.key] ? `error-${field.key}` : undefined}
+              />
+              {errors[field.key] && <small className="update-vitals-error" id={`error-${field.key}`}>{errors[field.key]}</small>}
+            </label>
+          ))}
+        </div>
+        {feedback && <div className={`update-vitals-feedback ${feedback.type}`} role={feedback.type === "error" || feedback.type === "uncertain" || feedback.type === "refresh-warning" ? "alert" : "status"}>
+          <p>{feedback.message}</p>
+          {feedback.assessmentWarning && <p>{feedback.assessmentWarning}</p>}
+        </div>}
+        <div className="form-actions">
+          <button type="button" className="outline-button" onClick={onCancel} disabled={isSaving}>Cancel</button>
+          <button type="submit" className="primary-button" disabled={!canSave || isSaving}>
+            {isSaving ? "Saving…" : "Save observation"}
+          </button>
+        </div>
+      </form>
+    </section>
   );
 }
 
